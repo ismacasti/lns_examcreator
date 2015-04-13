@@ -9,6 +9,7 @@ import string
 import tempfile
 import shlex
 import xml.etree.ElementTree as ET
+import threading
 
 #debian7 base
 #root pass: lnsexam
@@ -75,8 +76,8 @@ class Machine():
         args += ['--run-command', 'useradd -m -s /bin/bash -p {} -U -G sudo {}'.format(shlex.quote(password_hash), self.username)]
         if "debian" in self.hostname:
             args += ['--root-password', "password:{}".format(self.password)]
-            args += ['--install', 'sudo']
-        subprocess.check_call(args)
+            #args += ['--install', 'sudo'] #done in base img
+        subprocess.check_call(args, stdout=subprocess.DEVNULL)
             
     def install(self, libvirt_url):
         args = ['virt-install']
@@ -90,7 +91,7 @@ class Machine():
         args += ['--connect', libvirt_url]
         args += ['--noreboot']
         args += ['--noautoconsole']
-        subprocess.check_call(args)
+        subprocess.check_call(args, stdout=subprocess.DEVNULL)
     
     def render_interfaces_file(self):
         template = string.Template(self.net_template)
@@ -138,7 +139,7 @@ def parse_students(path, interface, base_domains):
     
 
 def create_overlay_image(base_path, overlay_path):
-    subprocess.check_call(['qemu-img', 'create', '-b', base_path, '-f', 'qcow2', overlay_path])
+    subprocess.check_call(['qemu-img', 'create', '-b', base_path, '-f', 'qcow2', overlay_path], stdout=subprocess.DEVNULL)
 
     
 def get_disk_from_domain(domain):
@@ -146,6 +147,27 @@ def get_disk_from_domain(domain):
     source_element = root.find(".//disk[@device='disk']/source")
     path = source_element.items()[0][1]
     return path
+
+def worker(student, base_images, template, libvirt_url):
+    print(color.BOLD + color.UNDERLINE + "Student: {} {}".format(student.name, student.surname) + color.END)
+    for machine in student.machines:
+        machine.hostname = "{}-{}-{}".format(student.name, student.surname, machine.base)
+        machine.domain = machine.hostname
+        base_dir = os.path.split(base_images[machine.base])[0]
+        new_img_path = os.path.join(base_dir, "{}.qcow2".format(machine.hostname))
+        
+        print(color.BOLD + "Creating image {}".format(new_img_path) + color.END)
+        create_overlay_image(base_images[machine.base], new_img_path)
+        machine.disk_path = new_img_path
+        machine.net_template = template
+        
+        print(color.BOLD + "Customizing {}".format(machine.domain) + color.END)
+        machine.customize()
+        
+        print(color.BOLD + "Installing {}".format(machine.domain) + color.END)
+        machine.install(libvirt_url)
+        
+    print(color.GREEN + "Machines for student {} {} are ready".format(student.name, student.surname) + color.END)
     
 def main(argv):
     parser = argparse.ArgumentParser(description="Automatically create exam machines")
@@ -158,34 +180,24 @@ def main(argv):
     conn = libvirt.open(args.libvirt_url)
     print(color.BOLD + "Connected to server: {}".format(conn.getHostname()) + color.END)
     base_images = dict()
-    print("List of base images:")
+    print(color.GREEN + "List of base images:")
     for i in args.base_domains:
         domain = conn.lookupByName(i)
         path = get_disk_from_domain(domain)
         base_images[i] = path
         print("{} → {}".format(i,path))
+    print(color.END)
     
     data = parse_students(args.students, args.interface, args.base_domains)
+    threads = []
     for student in data:
-        print(color.BOLD + "Student: {} {}".format(student.name, student.surname) + color.END)
-        for machine in student.machines:
-            machine.hostname = "{}-{}-{}".format(student.name, student.surname, machine.base)
-            machine.domain = machine.hostname
-            base_dir = os.path.split(base_images[machine.base])[0]
-            new_img_path = os.path.join(base_dir, "{}.qcow2".format(machine.hostname))
+        t = threading.Thread(target=worker, args=(student, base_images, debian_interfaces, args.libvirt_url,))
+        threads.append(t)
+        t.start()
             
-            print(color.BOLD + "Creating image {}".format(new_img_path) + color.END)
-            create_overlay_image(base_images[machine.base], new_img_path)
-            machine.disk_path = new_img_path
-            machine.net_template = debian_interfaces
-            
-            print(color.BOLD + "Customizing {}".format(machine.domain) + color.END)
-            machine.customize()
-            
-            print(color.BOLD + "Installing {}".format(machine.domain) + color.END)
-            machine.install(args.libvirt_url)
-            
-
+    for t in threads:
+        t.join()
+        
 if __name__ == "__main__":
     main(sys.argv[1:])
     
