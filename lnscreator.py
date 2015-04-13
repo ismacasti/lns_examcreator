@@ -5,6 +5,15 @@ import csv
 import subprocess
 import crypt
 import os
+import string
+import tempfile
+import shlex
+import xml.etree.ElementTree as ET
+
+#debian7 base
+#root pass: lnsexam
+#user: testuser
+#pass: lnsexam
 
 class color:
    PURPLE = '\033[95m'
@@ -51,41 +60,56 @@ class Machine():
     system = None
     disk_path = None
     domain = None
-    interface = "enp4s0"
+    interface = ""
     memory = 512
+    net_template = None
+    base = None
     
-    def customize(self, config_path):
-        password_hash = crypto.crypto(password)
+    def customize(self):
+        password_hash = crypt.crypt(self.password)
         args = ['virt-customize']
-        args += ['-a', disk_path]
+        args += ['-a', self.disk_path]
         args += ['--delete', '/etc/network/interfaces']
-        args += ['--hostname', hostname]
-        args += ['--copy-in', '{}:{}'.format(config_path, "/etc/network/interfaces")]
-        args += ['--run-command', 'useradd -m -p {} -U -G sudo {}'.format(password, username)]
+        args += ['--hostname', self.hostname]
+        args += ['--upload', '{}:{}'.format(self.render_interfaces_file(), "/etc/network/interfaces")]
+        args += ['--run-command', 'useradd -m -s /bin/bash -p {} -U -G sudo {}'.format(shlex.quote(password_hash), self.username)]
+        if "debian" in self.hostname:
+            args += ['--root-password', "password:{}".format(self.password)]
+            args += ['--install', 'sudo']
         subprocess.check_call(args)
             
     def install(self, libvirt_url):
         args = ['virt-install']
-        args += ['-w', 'type=direct,source={},model=virtio'.format(interface)]
-        args += ['--name', '{}@{}({})'.format(hostname, ip, system)]
-        args += ['--memory', memory]
-        args += ['--disk', disk_path]
+        args += ['-w', 'type=direct,source={},model=virtio'.format(self.interface)]
+        args += ['--name', '{}-{}'.format(self.hostname, self.ip)]
+        args += ['--memory', str(self.memory)]
+        args += ['--disk', self.disk_path]
         args += ['--os-variant', 'debian7']
         args += ['--cpu', 'host']
         args += ['--import']
         args += ['--connect', libvirt_url]
+        args += ['--noreboot']
+        args += ['--noautoconsole']
         subprocess.check_call(args)
     
+    def render_interfaces_file(self):
+        template = string.Template(self.net_template)
+        output = template.substitute(ip=self.ip, netmask=self.netmask, gateway=self.gateway, dns=self.dns)
+        f = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        f.write(output)
+        path = f.name
+        f.close()
+        return path
 
 class Student:
     name = None
     surname = None
-    machine = None
+    machines = None
     
     def __repr__(self) :
         return 'Name: {}'.format(self.name)
 
-def parse_students(path):
+def parse_students(path, interface, base_domains):
     f = open(path, 'r')
     reader = csv.DictReader(f)
     data = list()
@@ -94,44 +118,30 @@ def parse_students(path):
         student.name = row["Name"]
         student.surname = row["Surname"]
         
-        vm = Machine()
-        vm.username = row["Name"].lower()
-        vm.ip = row["IP"]
-        vm.netmask = row["Netmask"]
-        vm.dns = row["DNS"]
-        vm.gateway = row["Gateway"]
-        vm.password = row["Name"]
+        machines = list()
+        for domain in base_domains:
+            vm = Machine()
+            vm.username = row["Name"].lower()
+            vm.ip = row["IP"]
+            vm.netmask = row["Netmask"]
+            vm.dns = row["DNS"]
+            vm.gateway = row["Gateway"]
+            vm.password = row["Surname"].lower()
+            vm.base = domain
+            vm.interface = interface
+            machines.append(vm)
     
-        student.machine = vm
+        student.machines = machines
         data.append(student)
-    
+        
     return data
     
 
 def create_overlay_image(base_path, overlay_path):
     subprocess.check_call(['qemu-img', 'create', '-b', base_path, '-f', 'qcow2', overlay_path])
 
-def sysprep_image(img_path):
-    args = ["virt-sysprep"]
-    args += ["-a", img_path]
-    subprocess.check_call(args)
-    
-import string
-import tempfile
-def render_interfaces_file(machine, text):
-    template = string.Template(text)
-    output = template.substitute(ip=machine.ip, netmask=machine.netmask, gateway=machine.gateway, dns=machine.dns)
-    f = tempfile.NamedTemporaryFile(mode='w', delete=False)
-    f.write(output)
-    path = f.name
-    f.close()
-    return path
-
-def create_overlay_clone(machine, student):
-    network_config_file = render_interfaces_file(machine, network_configs[machine.system])
     
 def get_disk_from_domain(domain):
-    import xml.etree.ElementTree as ET
     root = ET.fromstring(domain.XMLDesc())
     source_element = root.find(".//disk[@device='disk']/source")
     path = source_element.items()[0][1]
@@ -155,16 +165,25 @@ def main(argv):
         base_images[i] = path
         print("{} → {}".format(i,path))
     
-    data = parse_students(args.students)
+    data = parse_students(args.students, args.interface, args.base_domains)
     for student in data:
-        print(color.BOLD + "Setting up {} {}".format(student.name, student.surname) + color.END)
-        for base_domain in base_images:
-            student.machine.hostname = "{}-{}-{}".format(student.name, student.surname, base_domain)
-            student.machine.domain = student.machine.hostname
-            base_dir = os.path.split(base_images[base_domain])[0]
-            new_img_path = os.path.join(base_dir, "{}.qcow2".format(student.machine.hostname))
-            create_overlay_image(base_images[base_domain], new_img_path)
-            student.machine.disk_path = new_img_path
+        print(color.BOLD + "Student: {} {}".format(student.name, student.surname) + color.END)
+        for machine in student.machines:
+            machine.hostname = "{}-{}-{}".format(student.name, student.surname, machine.base)
+            machine.domain = machine.hostname
+            base_dir = os.path.split(base_images[machine.base])[0]
+            new_img_path = os.path.join(base_dir, "{}.qcow2".format(machine.hostname))
+            
+            print(color.BOLD + "Creating image {}".format(new_img_path) + color.END)
+            create_overlay_image(base_images[machine.base], new_img_path)
+            machine.disk_path = new_img_path
+            machine.net_template = debian_interfaces
+            
+            print(color.BOLD + "Customizing {}".format(machine.domain) + color.END)
+            machine.customize()
+            
+            print(color.BOLD + "Installing {}".format(machine.domain) + color.END)
+            machine.install(args.libvirt_url)
             
 
 if __name__ == "__main__":
