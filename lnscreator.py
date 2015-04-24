@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 import sys, argparse
 import libvirt
 import csv
@@ -43,7 +43,7 @@ iface eth0 inet static
 address $ip
 netmask $netmask
 gateway $gateway
-nameserver $dns
+dns-nameserver $dns
 """
 network_configs = dict()
 network_configs['debian7'] = debian_interfaces
@@ -74,8 +74,10 @@ class Machine():
         args += ['--hostname', self.hostname]
         args += ['--upload', '{}:{}'.format(self.render_interfaces_file(), "/etc/network/interfaces")]
         args += ['--run-command', 'useradd -m -s /bin/bash -p {} -U -G sudo {}'.format(shlex.quote(password_hash), self.username)]
+        args += ['--run-command', 'dpkg-reconfigure openssh-server']
         if "debian" in self.hostname:
             args += ['--root-password', "password:{}".format(self.password)]
+            args += ['--delete', '/etc/resolv.conf']
             #args += ['--install', 'sudo'] #done in base img
         subprocess.check_call(args, stdout=subprocess.DEVNULL)
             
@@ -191,13 +193,10 @@ def main(argv):
     data = parse_students(args.students, args.interface, args.base_domains)
     threads = []
     for student in data:
-        t = threading.Thread(target=worker, args=(student, base_images, debian_interfaces, args.libvirt_url,))
-        threads.append(t)
-        t.start()
-            
-    for t in threads:
-        t.join()
+        worker(student, base_images, debian_interfaces, args.libvirt_url)
         
+        
+    print(color.BOLD + color.UNDERLINE + "Everything went fine. Enjoy the machines" + color.END)
 if __name__ == "__main__":
     main(sys.argv[1:])
     
